@@ -1,0 +1,122 @@
+{
+  "users": [
+    {
+      "id": "usr-admin",
+      "name": "PizzaHub Admin",
+      "email": "admin@pizzahub.example",
+      "passwordHash": "scrypt:af7f17d3a86095ac7baf9c6aa9c4bafc:f89762bac048559ce5aa7a742d48e2d2805d3ac39c88614acbd0bfdef9d9af770ab096870e34914df9a6245f381c5f9c640a60871e0ad49ad3f98dde5e2bcadd",
+      "role": "admin",
+      "status": "active",
+      "createdAt": "2025-11-01T12:00:00.000Z"
+    },
+    {
+      "id": "usr-vendor",
+      "name": "Little Oven Pizzeria",
+      "email": "hello@littleoven.example",
+      "passwordHash": "scrypt:060a3879fb92641ad0fd74073374ef3d:ba9e424b5e6bd285bfb1b997ababbd238b5253d23c6af572bc77803b1f01baf6bcd40504bdd9d87b6ae660dff9fbfc39b4289242a235230bfe29f6b392ddebd6",
+      "role": "vendor",
+      "status": "active",
+      "createdAt": "2025-11-02T12:00:00.000Z"
+    },
+    {
+      "id": "usr-customer",
+      "name": "Jamie Rivera",
+      "email": "jamie@example.com",
+      "passwordHash": "scrypt:18c11c89eeeece175068f49a8c1da159:a0d695676b3f9dfefc6d320218504eb3c4d83c5ee2a19e2a4a9f43e13ef8db9256bfaaaff8703f4ca302180f3a6e70fd34820b1242c86407149cc95ffb61da9c",
+      "role": "customer",
+      "status": "active",
+      "createdAt": "2025-11-03T12:00:00.000Z"
+    }
+  ],
+  "menuItems": [
+    {
+      "id": "classic-margherita",
+      "name": "The Classic Margherita",
+      "category": "Classic",
+      "description": "San Marzano tomato, creamy mozzarella, fresh basil.",
+      "price": 14.5,
+      "rating": "4.9",
+      "time": "20-25 min",
+      "tag": "Bestseller",
+      "location": "Downtown",
+      "vendor": "Little Oven Pizzeria",
+      "vendorId": "usr-vendor",
+      "image": "https://images.unsplash.com/photo-1579751626657-72bc17010498?auto=format&fit=crop&w=900&q=85",
+      "status": "approved",
+      "availability": "available"
+    },
+    {
+      "id": "garden-party",
+      "name": "Garden Party",
+      "category": "Veggie",
+      "description": "Roasted peppers, red onion, olives, and basil pesto.",
+      "price": 16,
+      "rating": "4.8",
+      "time": "25-30 min",
+      "tag": "Vegetarian",
+      "location": "Riverside",
+      "vendor": "Greenhouse Pizza Co.",
+      "vendorId": "usr-vendor",
+      "image": "https://images.unsplash.com/photo-1571407970349-bc81e7e96d47?auto=format&fit=crop&w=900&q=85",
+      "status": "approved",
+      "availability": "available"
+    },
+    {
+      "id": "smoky-pepperoni",
+      "name": "Smoky Pepperoni",
+      "category": "Meat",
+      "description": "Cup-and-char pepperoni, hot honey, aged parmesan.",
+      "price": 18.5,
+      "rating": "5.0",
+      "time": "20-25 min",
+      "tag": "Fan favorite",
+      "location": "Northside",
+      "vendor": "Brick & Basil",
+      "vendorId": "usr-vendor",
+      "image": "https://images.unsplash.com/photo-1628840042765-356cda07504e?auto=format&fit=crop&w=900&q=85",
+      "status": "pending",
+      "availability": "unavailable"
+    }
+  ],
+  "orders": [
+    {
+      "id": "ord-001",
+      "customerId": "usr-customer",
+      "customerName": "Jamie R.",
+      "vendorId": "usr-vendor",
+      "itemId": "smoky-pepperoni",
+      "itemName": "Smoky Pepperoni",
+      "restaurant": "Brick & Basil",
+      "deliveryDate": "Nov 20, 7:00 PM",
+      "address": "Northside",
+      "status": "pending",
+      "createdAt": "2025-11-18T12:00:00.000Z"
+    }
+  ],
+  "transactions": [
+    {
+      "id": "txn-001",
+      "restaurant": "Brick & Basil",
+      "plan": "Premium",
+      "amount": 19,
+      "date": "Nov 18, 2025",
+      "status": "succeeded"
+    },
+    {
+      "id": "txn-002",
+      "restaurant": "Greenhouse Pizza Co.",
+      "plan": "Premium",
+      "amount": 19,
+      "date": "Nov 17, 2025",
+      "status": "pending"
+    },
+    {
+      "id": "txn-003",
+      "restaurant": "Little Oven Pizzeria",
+      "plan": "Premium",
+      "amount": 19,
+      "date": "Nov 16, 2025",
+      "status": "failed"
+    }
+  ]
+}
