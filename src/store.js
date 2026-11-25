@@ -41,20 +41,30 @@ export function verifyPassword(password, encoded) {
   return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(candidate, "hex"));
 }
 
-export async function createStore() {
+async function loadFileState() {
   await mkdir(directory, { recursive: true });
-  let state;
   try {
-    state = JSON.parse(await readFile(dataFile, "utf8"));
-  } catch {
-    state = structuredClone(seed);
+    return JSON.parse(await readFile(dataFile, "utf8"));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+    const state = structuredClone(seed);
     for (const user of state.users) user.passwordHash = hashPassword("password");
     await writeFile(dataFile, JSON.stringify(state, null, 2));
+    return state;
   }
+}
 
-  const persist = async () => {
-    await writeFile(dataFile, JSON.stringify(state, null, 2));
-  };
+export async function createStore(database) {
+  const collection = database?.collection("pizzaHubAppState");
+  const savedState = collection ? await collection.findOne({ _id: "main" }) : null;
+  const state = savedState?.data || await loadFileState();
+  const persist = collection
+    ? async () => collection.updateOne({ _id: "main" }, { $set: { data: state } }, { upsert: true })
+    : async () => writeFile(dataFile, JSON.stringify(state, null, 2));
+
+  if (collection && !savedState) {
+    await collection.insertOne({ _id: "main", data: state });
+  }
 
   return {
     data: state,

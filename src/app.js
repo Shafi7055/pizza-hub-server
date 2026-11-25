@@ -1,30 +1,78 @@
 import express from "express";
 import cors from "cors";
+import multer from "multer";
+import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { createStore, hashPassword, verifyPassword } from "./store.js";
 import { createToken, verifyToken } from "./auth.js";
+import { isSupportedImage, uploadImageToImgBB } from "./image-upload.js";
 
 export async function createApp(options = {}) {
   const app = express();
   const store = options.store || await createStore();
-  const secret = options.tokenSecret || process.env.TOKEN_SECRET || "development-only-secret";
+  const auth = options.auth;
+  const imageUploader = options.imageUploader || uploadImageToImgBB;
+  const imgbbApiKey = options.imgbbApiKey ?? process.env.IMGBB_API_KEY;
+  const secret = options.tokenSecret || process.env.JWT_SECRET || process.env.TOKEN_SECRET || "development-only-secret";
   const allowedOrigin = process.env.CLIENT_ORIGIN || "http://localhost:3000";
+  const profileImageUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+    fileFilter(req, file, callback) {
+      if (!file.mimetype.startsWith("image/")) {
+        return callback(new Error("Only image files are allowed"));
+      }
+      callback(null, true);
+    },
+  }).single("image");
   store.data.favorites ||= [];
   store.data.reviews ||= [];
   store.data.emailNotifications ||= [];
 
-  app.use(cors({ origin: allowedOrigin === "*" ? "*" : allowedOrigin.split(",").map((value) => value.trim()) }));
+  app.use(cors({
+    origin: allowedOrigin === "*" ? "*" : allowedOrigin.split(",").map((value) => value.trim()),
+    credentials: true,
+  }));
+  if (auth) app.all("/api/better-auth/*", toNodeHandler(auth));
   app.use(express.json({ limit: "1mb" }));
 
   const publicUser = ({ passwordHash, ...user }) => user;
 
-  function authenticate(req, res, next) {
-    const header = req.headers.authorization || "";
-    const token = header.startsWith("Bearer ") ? header.slice(7) : null;
-    const claims = verifyToken(token, secret);
-    const user = claims ? store.data.users.find((entry) => entry.id === claims.sub) : null;
-    if (!user || user.status !== "active") return res.status(401).json({ message: "Authentication required" });
-    req.user = user;
-    next();
+  async function authenticate(req, res, next) {
+    try {
+      let user = null;
+      if (auth) {
+        const session = await auth.api.getSession({ headers: fromNodeHeaders(req.headers) });
+        if (session?.user) {
+          user = store.data.users.find((entry) => entry.id === session.user.id);
+          if (!user) {
+            user = {
+              id: session.user.id,
+              name: session.user.name,
+              email: session.user.email,
+              image: session.user.image,
+              role: session.user.role === "vendor" ? "vendor" : "customer",
+              status: "active",
+              createdAt: session.user.createdAt?.toISOString?.() || new Date().toISOString(),
+            };
+            store.data.users.push(user);
+            await store.persist();
+          }
+        }
+      }
+
+      if (!user) {
+        const header = req.headers.authorization || "";
+        const token = header.startsWith("Bearer ") ? header.slice(7) : null;
+        const claims = verifyToken(token, secret);
+        user = claims ? store.data.users.find((entry) => entry.id === claims.sub) : null;
+      }
+
+      if (!user || user.status !== "active") return res.status(401).json({ message: "Authentication required" });
+      req.user = user;
+      next();
+    } catch (error) {
+      next(error);
+    }
   }
 
   function authorize(...roles) {
@@ -34,6 +82,10 @@ export async function createApp(options = {}) {
   }
 
   app.get("/api/health", (req, res) => res.json({ status: "ok", service: "PizzaHub API" }));
+  app.get("/api/auth/providers", (req, res) => res.json({
+    betterAuth: Boolean(auth),
+    google: Boolean(auth && process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET),
+  }));
 
   app.post("/api/auth/register", async (req, res, next) => {
     try {
@@ -75,7 +127,7 @@ export async function createApp(options = {}) {
 
   app.get("/api/menu", (req, res) => {
     const { category, location, query, sort } = req.query;
-    let items = store.data.menuItems.filter((item) => item.status === "approved");
+    let items = store.data.menuItems.filter((item) => item.status === "approved" && item.availability === "available");
     if (category && category !== "All slices") items = items.filter((item) => item.category === category);
     if (location && location !== "All locations") items = items.filter((item) => item.location === location);
     if (query) {
@@ -88,7 +140,7 @@ export async function createApp(options = {}) {
   });
 
   app.get("/api/menu/:id", (req, res) => {
-    const item = store.data.menuItems.find((entry) => entry.id === req.params.id && entry.status === "approved");
+    const item = store.data.menuItems.find((entry) => entry.id === req.params.id && entry.status === "approved" && entry.availability === "available");
     if (!item) return res.status(404).json({ message: "Menu item not found" });
     res.json({ item });
   });
@@ -103,14 +155,16 @@ export async function createApp(options = {}) {
   app.post("/api/vendor/menu", authenticate, authorize("vendor"), async (req, res, next) => {
     try {
       const { name, category, description, price, location, image } = req.body;
-      if (!name || !category || !description || !location || price === undefined) return res.status(400).json({ message: "Name, category, description, location, and price are required" });
-      const numericPrice = Number(price);
-      if (!Number.isFinite(numericPrice) || numericPrice < 0) return res.status(400).json({ message: "Price must be a valid positive number" });
-      const activeCount = store.data.menuItems.filter((item) => item.vendorId === req.user.id && item.status === "approved" && item.availability === "available").length;
-      if ((req.user.subscriptionPlan || "free") === "free" && activeCount >= 3) {
-        return res.status(402).json({ message: "The Free plan allows at most 3 active menu items. Upgrade to Premium to add more." });
+      const itemName = String(name || "").trim();
+      const itemCategory = String(category || "").trim();
+      const itemDescription = String(description || "").trim();
+      const itemLocation = String(location || "").trim();
+      if (!itemName || !itemCategory || !itemDescription || !itemLocation || price === undefined || price === "") {
+        return res.status(400).json({ message: "Name, category, description, location, and price are required" });
       }
-      const item = { id: store.nextId("menu"), name: name.trim(), category, description: description.trim(), price: numericPrice, rating: "New", time: "25-30 min", tag: "New", location: location.trim(), vendor: req.user.name, vendorId: req.user.id, image: image || "", status: "pending", availability: "unavailable" };
+      const numericPrice = Number(price);
+      if (!Number.isFinite(numericPrice) || numericPrice < 0) return res.status(400).json({ message: "Price must be a valid nonnegative number" });
+      const item = { id: store.nextId("menu"), name: itemName, category: itemCategory, description: itemDescription, price: numericPrice, rating: "New", time: "25-30 min", tag: "New", location: itemLocation, vendor: req.user.name, vendorId: req.user.id, image: String(image || "").trim(), status: "pending", availability: "unavailable", createdAt: new Date().toISOString() };
       store.data.menuItems.push(item);
       await store.persist();
       res.status(201).json({ item });
@@ -123,6 +177,25 @@ export async function createApp(options = {}) {
       if (!item) return res.status(404).json({ message: "Menu item not found" });
       if (req.user.role === "vendor" && item.vendorId !== req.user.id) return res.status(403).json({ message: "This item belongs to another vendor" });
       const allowed = ["name", "category", "description", "price", "location", "image", "availability"];
+      if (Object.hasOwn(req.body, "availability")) {
+        if (!["available", "unavailable"].includes(req.body.availability)) {
+          return res.status(400).json({ message: "Invalid availability status" });
+        }
+        if (req.body.availability === "available" && item.status !== "approved") {
+          return res.status(400).json({ message: "Only approved items can be made available" });
+        }
+        if (req.user.role === "vendor" && req.body.availability === "available" && (req.user.subscriptionPlan || "free") === "free") {
+          const activeCount = store.data.menuItems.filter((entry) =>
+            entry.id !== item.id &&
+            entry.vendorId === req.user.id &&
+            entry.status === "approved" &&
+            entry.availability === "available"
+          ).length;
+          if (activeCount >= 3) {
+            return res.status(402).json({ message: "The Free plan allows at most 3 active menu items. Upgrade to Premium or make another item unavailable." });
+          }
+        }
+      }
       for (const key of allowed) if (Object.hasOwn(req.body, key)) item[key] = key === "price" ? Number(req.body[key]) : req.body[key];
       await store.persist();
       res.json({ item });
@@ -148,7 +221,18 @@ export async function createApp(options = {}) {
       if (!item) return res.status(404).json({ message: "Menu item not found" });
       if (!["pending", "approved", "rejected"].includes(req.body.status)) return res.status(400).json({ message: "Invalid menu status" });
       item.status = req.body.status;
-      if (item.status === "approved") item.availability = "available";
+      if (item.status === "approved") {
+        const vendor = store.data.users.find((entry) => entry.id === item.vendorId);
+        const activeCount = store.data.menuItems.filter((entry) =>
+          entry.id !== item.id &&
+          entry.vendorId === item.vendorId &&
+          entry.status === "approved" &&
+          entry.availability === "available"
+        ).length;
+        item.availability = (vendor?.subscriptionPlan || "free") === "premium" || activeCount < 3
+          ? "available"
+          : "unavailable";
+      }
       await store.persist();
       res.json({ item });
     } catch (error) { next(error); }
@@ -157,9 +241,14 @@ export async function createApp(options = {}) {
   app.post("/api/orders", authenticate, authorize("customer"), async (req, res, next) => {
     try {
       const { itemId, deliveryDate, address, message = "" } = req.body;
-      const item = store.data.menuItems.find((entry) => entry.id === itemId && entry.status === "approved");
+      const item = store.data.menuItems.find((entry) => entry.id === itemId && entry.status === "approved" && entry.availability === "available");
       if (!item) return res.status(404).json({ message: "Menu item not found or not available" });
-      if (!deliveryDate || !address) return res.status(400).json({ message: "Delivery date and address are required" });
+      const deliveryTimestamp = typeof deliveryDate === "string" ? Date.parse(deliveryDate) : NaN;
+      if (!Number.isFinite(deliveryTimestamp) || deliveryTimestamp <= Date.now()) {
+        return res.status(400).json({ message: "Choose a valid future delivery date and time" });
+      }
+      const deliveryAddress = String(address || "").trim();
+      if (!deliveryAddress) return res.status(400).json({ message: "Delivery address is required" });
       if (item.vendorId === req.user.id) return res.status(400).json({ message: "Vendors cannot order their own menu items" });
       const duplicate = store.data.orders.find((entry) =>
         entry.customerId === req.user.id &&
@@ -169,7 +258,7 @@ export async function createApp(options = {}) {
       );
       if (duplicate) return res.status(409).json({ message: "An active order already exists for this item and delivery date" });
       const now = new Date().toISOString();
-      const order = { id: store.nextId("ord"), customerId: req.user.id, customerName: req.user.name, vendorId: item.vendorId, itemId: item.id, itemName: item.name, restaurant: item.vendor, deliveryDate, address, message: String(message).trim(), status: "pending", createdAt: now, timeline: [{ status: "pending", at: now }] };
+      const order = { id: store.nextId("ord"), customerId: req.user.id, customerName: req.user.name, vendorId: item.vendorId, itemId: item.id, itemName: item.name, restaurant: item.vendor, deliveryDate: new Date(deliveryTimestamp).toISOString(), address: deliveryAddress, message: String(message).trim(), status: "pending", createdAt: now, timeline: [{ status: "pending", at: now }] };
       store.data.orders.push(order);
       await store.persist();
       res.status(201).json({ order });
@@ -190,8 +279,14 @@ export async function createApp(options = {}) {
       const order = store.data.orders.find((entry) => entry.id === req.params.id);
       if (!order) return res.status(404).json({ message: "Order not found" });
       if (req.user.role === "vendor" && order.vendorId !== req.user.id) return res.status(403).json({ message: "This order belongs to another vendor" });
-      if (order.status !== "pending") return res.status(400).json({ message: "Only pending orders can be accepted or rejected" });
-      if (!["accepted", "rejected", "delivered"].includes(req.body.status)) return res.status(400).json({ message: "Invalid order status" });
+      const allowedStatuses = order.status === "pending"
+        ? ["accepted", "rejected"]
+        : order.status === "accepted"
+          ? ["delivered"]
+          : [];
+      if (!allowedStatuses.includes(req.body.status)) {
+        return res.status(400).json({ message: "Pending orders can be accepted or rejected; accepted orders can be marked delivered" });
+      }
       order.status = req.body.status;
       order.timeline ||= [];
       if (!order.timeline.some((entry) => entry.status === req.body.status)) {
@@ -242,6 +337,9 @@ export async function createApp(options = {}) {
       const user = store.data.users.find((entry) => entry.id === req.params.id);
       if (!user) return res.status(404).json({ message: "User not found" });
       if (!["active", "blocked"].includes(req.body.status)) return res.status(400).json({ message: "Invalid user status" });
+      if (user.id === req.user.id && req.body.status === "blocked") {
+        return res.status(400).json({ message: "You cannot block your own admin account" });
+      }
       user.status = req.body.status;
       await store.persist();
       res.json({ user: publicUser(user) });
@@ -310,9 +408,36 @@ export async function createApp(options = {}) {
     res.status(501).json({ message: "Webhook verification is ready to configure." });
   });
 
-  app.post("/api/vendor/profile/image", authenticate, authorize("vendor", "customer"), (req, res) => {
-    if (!process.env.IMGBB_API_KEY) return res.status(503).json({ message: "ImgBB is not configured. Set IMGBB_API_KEY." });
-    res.status(501).json({ message: "ImgBB upload is ready to configure." });
+  app.post("/api/vendor/profile/image", authenticate, authorize("vendor", "customer"), (req, res, next) => {
+    profileImageUpload(req, res, (error) => {
+      if (!error) return next();
+      if (error instanceof multer.MulterError && error.code === "LIMIT_FILE_SIZE") {
+        return res.status(413).json({ message: "Image must be 5 MB or smaller" });
+      }
+      if (error.message === "Only image files are allowed") {
+        return res.status(415).json({ message: error.message });
+      }
+      if (error instanceof multer.MulterError) {
+        return res.status(400).json({ message: "Upload one image at a time" });
+      }
+      next(error);
+    });
+  }, async (req, res) => {
+    if (!imgbbApiKey) return res.status(503).json({ message: "ImgBB is not configured. Set IMGBB_API_KEY." });
+    if (!req.file) return res.status(400).json({ message: "Choose an image to upload" });
+    if (!isSupportedImage(req.file)) {
+      return res.status(415).json({ message: "Upload a valid PNG, JPEG, GIF, or WebP image" });
+    }
+
+    try {
+      const image = await imageUploader(req.file, imgbbApiKey);
+      req.user.image = image;
+      await store.persist();
+      res.status(201).json({ image, user: publicUser(req.user) });
+    } catch (error) {
+      console.error("ImgBB upload failed:", error.name);
+      res.status(502).json({ message: "Image hosting is unavailable. Try again later." });
+    }
   });
 
   app.use((req, res) => res.status(404).json({ message: "Route not found" }));
