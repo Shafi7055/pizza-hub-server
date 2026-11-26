@@ -435,8 +435,9 @@ export async function createApp(options = {}) {
       await store.persist();
       res.status(201).json({ image, user: publicUser(req.user) });
     } catch (error) {
-      console.error("ImgBB upload failed:", error.name);
-      res.status(502).json({ message: "Image hosting is unavailable. Try again later." });
+      const message = error instanceof Error ? error.message : "ImgBB upload failed";
+      console.error("ImgBB upload failed:", message);
+      res.status(502).json({ message });
     }
   });
 

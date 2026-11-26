@@ -22,7 +22,7 @@ export function isSupportedImage(file) {
 
 export async function uploadImageToImgBB(file, apiKey) {
   const form = new FormData();
-  form.append("image", new Blob([file.buffer], { type: file.mimetype }));
+  form.append("image", new Blob([file.buffer], { type: file.mimetype }), file.originalname || "upload");
 
   const endpoint = new URL("https://api.imgbb.com/1/upload");
   endpoint.searchParams.set("key", apiKey);
@@ -43,7 +43,12 @@ export async function uploadImageToImgBB(file, apiKey) {
 
   const imageUrl = result?.data?.display_url || result?.data?.url;
   if (!response.ok || !result?.success || typeof imageUrl !== "string") {
-    throw new Error("ImgBB rejected the image upload");
+    const reason = result?.error?.message;
+    throw new Error(
+      typeof reason === "string" && reason
+        ? `ImgBB rejected the image upload: ${reason}`
+        : `ImgBB rejected the image upload (HTTP ${response.status})`
+    );
   }
 
   let parsedUrl;

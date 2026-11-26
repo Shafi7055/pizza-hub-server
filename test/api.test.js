@@ -349,7 +349,7 @@ test("Mongo-backed store persists its state document", async () => {
   assert.equal(document.data.users.at(-1).id, "new-user");
 });
 
-test("profile image upload validates and stores the hosted image URL", async () => {
+test("profile image upload validates, stores the hosted URL, and reports ImgBB failures", async (t) => {
   const vendor = { id: "vendor-1", name: "Vendor", email: "vendor@test.com", role: "vendor", status: "active", passwordHash: "" };
   const store = {
     data: { users: [vendor], menuItems: [], orders: [], transactions: [] },
@@ -358,6 +358,8 @@ test("profile image upload validates and stores the hosted image URL", async () 
     nextId(prefix) { return `${prefix}-1`; }
   };
   let uploadedFile;
+  let uploadFailure;
+  t.mock.method(console, "error", () => {});
   const app = await createApp({
     store,
     tokenSecret: "test-secret",
@@ -365,6 +367,7 @@ test("profile image upload validates and stores the hosted image URL", async () 
     async imageUploader(file, apiKey) {
       assert.equal(apiKey, "test-api-key");
       uploadedFile = file;
+      if (uploadFailure) throw uploadFailure;
       return "https://i.ibb.co/test/profile.png";
     }
   });
@@ -395,12 +398,24 @@ test("profile image upload validates and stores the hosted image URL", async () 
       body: invalidFile
     });
     assert.equal(invalidResponse.status, 415);
+
+    uploadFailure = new Error("ImgBB rejected the image upload: Invalid API key");
+    const failedImage = new FormData();
+    failedImage.append("image", new Blob([pngSignature], { type: "image/png" }), "profile.png");
+    const failedResponse = await fetch(`${base}/api/vendor/profile/image`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: failedImage
+    });
+    assert.equal(failedResponse.status, 502);
+    assert.equal((await failedResponse.json()).message, "ImgBB rejected the image upload: Invalid API key");
   } finally {
     server.close();
   }
 });
 
 test("ImgBB helper sends multipart data and returns the hosted URL", async (t) => {
+  let rejectUpload = false;
   t.mock.method(globalThis, "fetch", async (input, options) => {
     const endpoint = new URL(input);
     assert.equal(endpoint.origin, "https://api.imgbb.com");
@@ -408,6 +423,13 @@ test("ImgBB helper sends multipart data and returns the hosted URL", async (t) =
     assert.equal(endpoint.searchParams.get("key"), "test-api-key");
     assert.ok(options.body instanceof FormData);
     assert.equal(options.body.get("image").type, "image/png");
+    assert.equal(options.body.get("image").name, "pizza.png");
+    if (rejectUpload) {
+      return new Response(JSON.stringify({
+        success: false,
+        error: { message: "Invalid API key" }
+      }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
     return new Response(JSON.stringify({
       success: true,
       data: { display_url: "https://i.ibb.co/test/profile.png" }
@@ -416,10 +438,20 @@ test("ImgBB helper sends multipart data and returns the hosted URL", async (t) =
 
   const image = await uploadImageToImgBB({
     buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    mimetype: "image/png"
+    mimetype: "image/png",
+    originalname: "pizza.png"
   }, "test-api-key");
 
   assert.equal(image, "https://i.ibb.co/test/profile.png");
+  rejectUpload = true;
+  await assert.rejects(
+    uploadImageToImgBB({
+      buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+      mimetype: "image/png",
+      originalname: "pizza.png"
+    }, "test-api-key"),
+    /ImgBB rejected the image upload: Invalid API key/
+  );
   assert.equal(isSupportedImage({
     buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     mimetype: "image/png"

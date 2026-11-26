@@ -16,6 +16,8 @@ Copy `.env.example` to `.env` and replace the example secrets with unique values
 
 Set `NEXT_PUBLIC_API_URL=http://localhost:3002` in the client environment (see the client `.env.example`). Stripe, ImgBB, and SMTP settings remain optional integrations.
 
+For profile image uploads, set a valid `IMGBB_API_KEY` in the server `.env` (never in a `NEXT_PUBLIC_` client variable) and restart the API after changing it. The API reports ImgBB's rejection reason when an upload fails.
+
 ## Demo accounts
 
 Seeded accounts use password `password`:
