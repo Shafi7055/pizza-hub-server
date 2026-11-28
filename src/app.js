@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import multer from "multer";
+import Stripe from "stripe";
 import { fromNodeHeaders, toNodeHandler } from "better-auth/node";
 import { createStore, hashPassword, verifyPassword } from "./store.js";
 import { createToken, verifyToken } from "./auth.js";
@@ -12,8 +13,12 @@ export async function createApp(options = {}) {
   const auth = options.auth;
   const imageUploader = options.imageUploader || uploadImageToImgBB;
   const imgbbApiKey = options.imgbbApiKey ?? process.env.IMGBB_API_KEY;
+  const stripeClient = options.stripeClient ?? (process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null);
+  const stripePriceId = options.stripePriceId ?? process.env.STRIPE_PRICE_ID;
+  const stripeWebhookSecret = options.stripeWebhookSecret ?? process.env.STRIPE_WEBHOOK_SECRET;
   const secret = options.tokenSecret || process.env.JWT_SECRET || process.env.TOKEN_SECRET || "development-only-secret";
   const allowedOrigin = process.env.CLIENT_ORIGIN || "http://localhost:3000";
+  const clientOrigin = allowedOrigin.split(",")[0].trim();
   const profileImageUpload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 5 * 1024 * 1024, files: 1 },
@@ -27,12 +32,175 @@ export async function createApp(options = {}) {
   store.data.favorites ||= [];
   store.data.reviews ||= [];
   store.data.emailNotifications ||= [];
+  store.data.processedStripeEvents ||= [];
 
   app.use(cors({
     origin: allowedOrigin === "*" ? "*" : allowedOrigin.split(",").map((value) => value.trim()),
     credentials: true,
   }));
   if (auth) app.all("/api/better-auth/*", toNodeHandler(auth));
+
+  function stripeObjectId(value) {
+    return typeof value === "string" ? value : value?.id || null;
+  }
+
+  function recordStripeTransaction({ vendor, sessionId, invoiceId, amount, currency, status, created }) {
+    let transaction = store.data.transactions.find((entry) =>
+      (invoiceId && entry.stripeInvoiceId === invoiceId) ||
+      (sessionId && entry.stripeSessionId === sessionId)
+    );
+    const values = {
+      id: transaction?.id || store.nextId("txn"),
+      vendorId: vendor.id,
+      restaurant: vendor.businessName || vendor.name,
+      plan: "Premium",
+      amount: Number(amount || 0) / 100,
+      currency: String(currency || "usd").toUpperCase(),
+      date: Number.isFinite(created) ? new Date(created * 1000).toISOString() : new Date().toISOString(),
+      status,
+      ...(sessionId ? { stripeSessionId: sessionId } : {}),
+      ...(invoiceId ? { stripeInvoiceId: invoiceId } : {}),
+    };
+    if (transaction) Object.assign(transaction, values);
+    else {
+      transaction = values;
+      store.data.transactions.push(transaction);
+    }
+  }
+
+  function updateVendorSubscription(vendor, subscription, fallbackStatus) {
+    const status = subscription.status || fallbackStatus;
+    vendor.stripeCustomerId = stripeObjectId(subscription.customer) || vendor.stripeCustomerId;
+    vendor.stripeSubscriptionId = stripeObjectId(subscription.id) || vendor.stripeSubscriptionId;
+    vendor.subscriptionStatus = status;
+    if (["active", "trialing", "past_due"].includes(status)) {
+      vendor.subscriptionPlan = "premium";
+    } else if (["canceled", "unpaid", "incomplete_expired"].includes(status)) {
+      vendor.subscriptionPlan = "free";
+    }
+    if (Number.isFinite(subscription.current_period_end)) {
+      vendor.subscriptionCurrentPeriodEnd = new Date(subscription.current_period_end * 1000).toISOString();
+    }
+  }
+
+  async function findStripeVendor({ vendorId, subscriptionId, customerId }) {
+    let vendor = store.data.users.find((entry) => entry.id === vendorId && entry.role === "vendor");
+    if (!vendor && subscriptionId) {
+      vendor = store.data.users.find((entry) => entry.role === "vendor" && entry.stripeSubscriptionId === subscriptionId);
+    }
+    if (!vendor && customerId) {
+      vendor = store.data.users.find((entry) => entry.role === "vendor" && entry.stripeCustomerId === customerId);
+    }
+    if (!vendor && stripeClient && subscriptionId) {
+      const subscription = await stripeClient.subscriptions.retrieve(subscriptionId);
+      vendor = store.data.users.find((entry) =>
+        entry.id === subscription.metadata?.vendorId && entry.role === "vendor"
+      );
+    }
+    return vendor;
+  }
+
+  async function processStripeEvent(event) {
+    const data = event.data.object;
+    if (event.type === "checkout.session.completed" || event.type === "checkout.session.async_payment_succeeded" || event.type === "checkout.session.async_payment_failed") {
+      if (data.mode !== "subscription") return;
+      const vendor = await findStripeVendor({
+        vendorId: data.metadata?.vendorId || data.client_reference_id,
+        subscriptionId: stripeObjectId(data.subscription),
+        customerId: stripeObjectId(data.customer),
+      });
+      if (!vendor) throw new Error(`Stripe Checkout session ${data.id} does not match a vendor`);
+
+      const succeeded = event.type === "checkout.session.async_payment_succeeded" ||
+        (event.type === "checkout.session.completed" && ["paid", "no_payment_required"].includes(data.payment_status));
+      const failed = event.type === "checkout.session.async_payment_failed";
+      if (succeeded) {
+        updateVendorSubscription(vendor, {
+          id: stripeObjectId(data.subscription),
+          customer: stripeObjectId(data.customer),
+          status: "active",
+        }, "active");
+      } else {
+        vendor.stripeCustomerId = stripeObjectId(data.customer) || vendor.stripeCustomerId;
+        vendor.stripeSubscriptionId = stripeObjectId(data.subscription) || vendor.stripeSubscriptionId;
+        if (!vendor.subscriptionStatus || vendor.subscriptionStatus === "pending") {
+          vendor.subscriptionStatus = failed ? "incomplete_expired" : "pending";
+        }
+        if (failed && vendor.subscriptionPlan !== "premium") vendor.subscriptionPlan = "free";
+      }
+
+      recordStripeTransaction({
+        vendor,
+        sessionId: data.id,
+        amount: data.amount_total,
+        currency: data.currency,
+        status: succeeded ? "succeeded" : failed ? "failed" : "pending",
+        created: data.created,
+      });
+      return;
+    }
+
+    if (event.type === "customer.subscription.created" || event.type === "customer.subscription.updated" || event.type === "customer.subscription.deleted") {
+      const subscription = data;
+      const vendor = await findStripeVendor({
+        vendorId: subscription.metadata?.vendorId,
+        subscriptionId: stripeObjectId(subscription.id),
+        customerId: stripeObjectId(subscription.customer),
+      });
+      if (!vendor) throw new Error(`Stripe subscription ${subscription.id} does not match a vendor`);
+      updateVendorSubscription(vendor, subscription, event.type === "customer.subscription.deleted" ? "canceled" : undefined);
+      return;
+    }
+
+    if (event.type === "invoice.paid" || event.type === "invoice.payment_failed") {
+      const invoice = data;
+      const subscriptionId = stripeObjectId(invoice.subscription) ||
+        stripeObjectId(invoice.parent?.subscription_details?.subscription);
+      if (event.type === "invoice.paid" && invoice.billing_reason === "subscription_create") return;
+      const vendor = await findStripeVendor({
+        subscriptionId,
+        customerId: stripeObjectId(invoice.customer),
+      });
+      if (!vendor) throw new Error(`Stripe invoice ${invoice.id} does not match a vendor`);
+      if (event.type === "invoice.paid") {
+        vendor.subscriptionStatus = "active";
+        vendor.subscriptionPlan = "premium";
+      } else {
+        vendor.subscriptionStatus = "past_due";
+      }
+      recordStripeTransaction({
+        vendor,
+        invoiceId: invoice.id,
+        amount: event.type === "invoice.paid" ? invoice.amount_paid : invoice.amount_due,
+        currency: invoice.currency,
+        status: event.type === "invoice.paid" ? "succeeded" : "failed",
+        created: invoice.created,
+      });
+    }
+  }
+
+  app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res, next) => {
+    if (!stripeClient || !stripeWebhookSecret) {
+      return res.status(503).json({ message: "Stripe webhook is not configured. Set STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET." });
+    }
+    let event;
+    try {
+      event = stripeClient.webhooks.constructEvent(req.body, req.headers["stripe-signature"], stripeWebhookSecret);
+    } catch {
+      return res.status(400).json({ message: "Invalid Stripe webhook signature" });
+    }
+    if (store.data.processedStripeEvents.includes(event.id)) return res.json({ received: true, duplicate: true });
+
+    try {
+      await processStripeEvent(event);
+      store.data.processedStripeEvents.push(event.id);
+      await store.persist();
+      res.json({ received: true });
+    } catch (error) {
+      next(error);
+    }
+  });
+
   app.use(express.json({ limit: "1mb" }));
 
   const publicUser = ({ passwordHash, ...user }) => user;
@@ -238,6 +406,72 @@ export async function createApp(options = {}) {
     } catch (error) { next(error); }
   });
 
+  app.post("/api/orders/checkout", authenticate, authorize("customer"), async (req, res, next) => {
+    try {
+      const { items, deliveryDate, address, message = "" } = req.body;
+      if (!Array.isArray(items) || items.length === 0 || items.length > 50) {
+        return res.status(400).json({ message: "Add between 1 and 50 menu items to your cart" });
+      }
+
+      const deliveryTimestamp = typeof deliveryDate === "string" ? Date.parse(deliveryDate) : NaN;
+      if (!Number.isFinite(deliveryTimestamp) || deliveryTimestamp <= Date.now()) {
+        return res.status(400).json({ message: "Choose a valid future delivery date and time" });
+      }
+      const deliveryAddress = String(address || "").trim();
+      if (!deliveryAddress) return res.status(400).json({ message: "Delivery address is required" });
+
+      const seenItemIds = new Set();
+      const orderLines = [];
+      for (const line of items) {
+        const itemId = typeof line?.itemId === "string" ? line.itemId : "";
+        const quantity = Number(line?.quantity);
+        if (!itemId || seenItemIds.has(itemId) || !Number.isInteger(quantity) || quantity < 1 || quantity > 99) {
+          return res.status(400).json({ message: "Cart items must have unique menu IDs and quantities from 1 to 99" });
+        }
+        seenItemIds.add(itemId);
+
+        const item = store.data.menuItems.find((entry) =>
+          entry.id === itemId && entry.status === "approved" && entry.availability === "available"
+        );
+        if (!item) return res.status(404).json({ message: "A menu item in your cart is no longer available" });
+        if (item.vendorId === req.user.id) return res.status(400).json({ message: "Vendors cannot order their own menu items" });
+        orderLines.push({ item, quantity });
+      }
+
+      const canonicalDeliveryDate = new Date(deliveryTimestamp).toISOString();
+      const duplicate = orderLines.some(({ item }) => store.data.orders.some((entry) =>
+        entry.customerId === req.user.id &&
+        entry.itemId === item.id &&
+        entry.deliveryDate === canonicalDeliveryDate &&
+        ["pending", "accepted"].includes(entry.status)
+      ));
+      if (duplicate) return res.status(409).json({ message: "An active order already exists for a cart item and delivery date" });
+
+      const now = new Date().toISOString();
+      const orders = orderLines.map(({ item, quantity }) => ({
+        id: store.nextId("ord"),
+        customerId: req.user.id,
+        customerName: req.user.name,
+        vendorId: item.vendorId,
+        itemId: item.id,
+        itemName: item.name,
+        restaurant: item.vendor,
+        quantity,
+        unitPrice: Number(item.price),
+        totalAmount: Number((Number(item.price) * quantity).toFixed(2)),
+        deliveryDate: canonicalDeliveryDate,
+        address: deliveryAddress,
+        message: String(message).trim(),
+        status: "pending",
+        createdAt: now,
+        timeline: [{ status: "pending", at: now }],
+      }));
+      store.data.orders.push(...orders);
+      await store.persist();
+      res.status(201).json({ orders });
+    } catch (error) { next(error); }
+  });
+
   app.post("/api/orders", authenticate, authorize("customer"), async (req, res, next) => {
     try {
       const { itemId, deliveryDate, address, message = "" } = req.body;
@@ -376,7 +610,22 @@ export async function createApp(options = {}) {
   app.get("/api/reviews/:itemId", (req, res) => {
     const reviews = store.data.reviews.filter((entry) => entry.itemId === req.params.itemId);
     const average = reviews.length ? reviews.reduce((sum, entry) => sum + entry.rating, 0) / reviews.length : null;
-    res.json({ average, reviews });
+    const item = store.data.menuItems.find((entry) => entry.id === req.params.itemId);
+    const restaurantItemIds = new Set(
+      store.data.menuItems
+        .filter((entry) => item && entry.vendorId === item.vendorId)
+        .map((entry) => entry.id)
+    );
+    const restaurantReviews = store.data.reviews.filter((entry) => restaurantItemIds.has(entry.itemId));
+    const restaurantAverage = restaurantReviews.length
+      ? restaurantReviews.reduce((sum, entry) => sum + entry.rating, 0) / restaurantReviews.length
+      : null;
+    res.json({
+      average,
+      reviews,
+      restaurantAverage,
+      restaurantReviewCount: restaurantReviews.length
+    });
   });
 
   app.post("/api/reviews/:itemId", authenticate, authorize("customer"), async (req, res, next) => {
@@ -388,7 +637,7 @@ export async function createApp(options = {}) {
       const delivered = store.data.orders.some((entry) => entry.customerId === req.user.id && entry.itemId === item.id && ["accepted", "delivered"].includes(entry.status));
       if (!delivered) return res.status(403).json({ message: "Only customers with an active or completed order can review this item" });
       const existingIndex = store.data.reviews.findIndex((entry) => entry.customerId === req.user.id && entry.itemId === item.id);
-      const review = { id: existingIndex >= 0 ? store.data.reviews[existingIndex].id : store.nextId("review"), itemId: item.id, customerId: req.user.id, customerName: req.user.name, rating, comment: String(req.body.comment || "").trim(), createdAt: new Date().toISOString() };
+      const review = { id: existingIndex >= 0 ? store.data.reviews[existingIndex].id : store.nextId("review"), itemId: item.id, vendorId: item.vendorId, customerId: req.user.id, customerName: req.user.name, rating, comment: String(req.body.comment || "").trim(), createdAt: new Date().toISOString() };
       if (existingIndex >= 0) store.data.reviews[existingIndex] = review;
       else store.data.reviews.push(review);
       await store.persist();
@@ -396,16 +645,32 @@ export async function createApp(options = {}) {
     } catch (error) { next(error); }
   });
 
-  app.post("/api/vendor/subscription/checkout", authenticate, authorize("vendor"), (req, res) => {
-    if (!process.env.STRIPE_SECRET_KEY) {
-      return res.status(503).json({ message: "Stripe Checkout is not configured. Set STRIPE_SECRET_KEY and STRIPE_PRICE_ID." });
+  app.post("/api/vendor/subscription/checkout", authenticate, authorize("vendor"), async (req, res, next) => {
+    if (!stripeClient || !stripePriceId || !stripeWebhookSecret) {
+      return res.status(503).json({ message: "Stripe Checkout is not fully configured. Set STRIPE_SECRET_KEY, STRIPE_PRICE_ID, and STRIPE_WEBHOOK_SECRET." });
     }
-    res.status(501).json({ message: "Stripe Checkout is ready to configure with STRIPE_SECRET_KEY and STRIPE_PRICE_ID." });
-  });
+    if (req.user.subscriptionPlan === "premium" && ["active", "trialing", "past_due"].includes(req.user.subscriptionStatus)) {
+      return res.status(409).json({ message: "Your Premium subscription is already active." });
+    }
 
-  app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), (req, res) => {
-    if (!process.env.STRIPE_WEBHOOK_SECRET) return res.status(503).json({ message: "Stripe webhook secret is not configured" });
-    res.status(501).json({ message: "Webhook verification is ready to configure." });
+    try {
+      const session = await stripeClient.checkout.sessions.create({
+        mode: "subscription",
+        line_items: [{ price: stripePriceId, quantity: 1 }],
+        success_url: `${clientOrigin}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${clientOrigin}/payment/cancel`,
+        client_reference_id: req.user.id,
+        metadata: { vendorId: req.user.id },
+        subscription_data: { metadata: { vendorId: req.user.id } },
+        ...(req.user.stripeCustomerId
+          ? { customer: req.user.stripeCustomerId }
+          : { customer_email: req.user.email }),
+      });
+      if (!session.url) throw new Error("Stripe did not return a Checkout URL");
+      res.json({ url: session.url });
+    } catch (error) {
+      next(error);
+    }
   });
 
   app.post("/api/vendor/profile/image", authenticate, authorize("vendor", "customer"), (req, res, next) => {

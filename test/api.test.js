@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
+import Stripe from "stripe";
 import { createApp } from "../src/app.js";
 import { createToken, parseTokenLifetime, verifyToken } from "../src/auth.js";
 import { isSupportedImage, uploadImageToImgBB } from "../src/image-upload.js";
@@ -10,6 +12,12 @@ async function listen(app) {
   await new Promise((resolve) => server.once("listening", resolve));
   const address = server.address();
   return { server, base: `http://127.0.0.1:${address.port}` };
+}
+
+function stripeSignature(payload, secret) {
+  const timestamp = Math.floor(Date.now() / 1000);
+  const signature = crypto.createHmac("sha256", secret).update(`${timestamp}.${payload}`).digest("hex");
+  return `t=${timestamp},v1=${signature}`;
 }
 
 test("health and public menu endpoints work", async () => {
@@ -36,6 +44,149 @@ test("health and public menu endpoints work", async () => {
   }
 });
 
+test("Stripe Checkout creates a vendor subscription session", async () => {
+  const vendor = { id: "vendor-1", name: "Little Oven", email: "vendor@test.com", role: "vendor", status: "active", subscriptionPlan: "free" };
+  const store = {
+    data: { users: [vendor], menuItems: [], orders: [], transactions: [] },
+    async persist() {},
+    nextId(prefix) { return `${prefix}-1`; }
+  };
+  const stripe = new Stripe("sk_test_checkout");
+  let checkoutOptions;
+  stripe.checkout.sessions.create = async (options) => {
+    checkoutOptions = options;
+    return { url: "https://checkout.stripe.test/session" };
+  };
+  const app = await createApp({
+    store,
+    tokenSecret: "test-secret",
+    stripeClient: stripe,
+    stripePriceId: "price_premium",
+    stripeWebhookSecret: "whsec_webhook_test"
+  });
+  const { server, base } = await listen(app);
+  try {
+    const response = await fetch(`${base}/api/vendor/subscription/checkout`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${createToken(vendor, "test-secret")}` }
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { url: "https://checkout.stripe.test/session" });
+    assert.equal(checkoutOptions.mode, "subscription");
+    assert.deepEqual(checkoutOptions.line_items, [{ price: "price_premium", quantity: 1 }]);
+    assert.equal(checkoutOptions.client_reference_id, vendor.id);
+    assert.equal(checkoutOptions.subscription_data.metadata.vendorId, vendor.id);
+    assert.match(checkoutOptions.success_url, /payment\/success\?session_id=/);
+  } finally {
+    server.close();
+  }
+});
+
+test("Stripe webhooks verify signatures, activate Premium once, and record payment", async () => {
+  const vendor = { id: "vendor-1", name: "Little Oven", email: "vendor@test.com", role: "vendor", status: "active", subscriptionPlan: "free" };
+  const store = {
+    data: { users: [vendor], menuItems: [], orders: [], transactions: [] },
+    persisted: false,
+    async persist() { this.persisted = true; },
+    nextId(prefix) { return `${prefix}-1`; }
+  };
+  const stripe = new Stripe("sk_test_webhook");
+  const app = await createApp({
+    store,
+    tokenSecret: "test-secret",
+    stripeClient: stripe,
+    stripeWebhookSecret: "whsec_webhook_test"
+  });
+  const { server, base } = await listen(app);
+  const event = {
+    id: "evt_checkout_completed",
+    object: "event",
+    created: Math.floor(Date.now() / 1000),
+    data: {
+      object: {
+        id: "cs_test_checkout",
+        object: "checkout.session",
+        mode: "subscription",
+        payment_status: "paid",
+        client_reference_id: vendor.id,
+        metadata: { vendorId: vendor.id },
+        customer: "cus_test",
+        subscription: "sub_test",
+        amount_total: 1900,
+        currency: "usd",
+        created: Math.floor(Date.now() / 1000)
+      }
+    },
+    livemode: false,
+    pending_webhooks: 1,
+    type: "checkout.session.completed"
+  };
+  const payload = JSON.stringify(event);
+  const signature = stripeSignature(payload, "whsec_webhook_test");
+
+  try {
+    const invalid = await fetch(`${base}/api/stripe/webhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Stripe-Signature": "invalid" },
+      body: payload
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal(vendor.subscriptionPlan, "free");
+
+    const response = await fetch(`${base}/api/stripe/webhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Stripe-Signature": signature },
+      body: payload
+    });
+    assert.equal(response.status, 200);
+    assert.equal(vendor.subscriptionPlan, "premium");
+    assert.equal(vendor.subscriptionStatus, "active");
+    assert.equal(vendor.stripeSubscriptionId, "sub_test");
+    assert.equal(store.data.transactions.length, 1);
+    assert.equal(store.data.transactions[0].amount, 19);
+    assert.equal(store.data.transactions[0].status, "succeeded");
+    assert.equal(store.persisted, true);
+
+    const duplicate = await fetch(`${base}/api/stripe/webhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Stripe-Signature": signature },
+      body: payload
+    });
+    assert.equal(duplicate.status, 200);
+    assert.equal((await duplicate.json()).duplicate, true);
+    assert.equal(store.data.transactions.length, 1);
+
+    const deletedEvent = {
+      ...event,
+      id: "evt_subscription_deleted",
+      type: "customer.subscription.deleted",
+      data: {
+        object: {
+          id: "sub_test",
+          object: "subscription",
+          customer: "cus_test",
+          status: "canceled",
+          metadata: { vendorId: vendor.id }
+        }
+      }
+    };
+    const deletedPayload = JSON.stringify(deletedEvent);
+    const deleted = await fetch(`${base}/api/stripe/webhook`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Stripe-Signature": stripeSignature(deletedPayload, "whsec_webhook_test")
+      },
+      body: deletedPayload
+    });
+    assert.equal(deleted.status, 200);
+    assert.equal(vendor.subscriptionPlan, "free");
+    assert.equal(vendor.subscriptionStatus, "canceled");
+  } finally {
+    server.close();
+  }
+});
+
 test("authentication rejects invalid credentials", async () => {
   const store = {
     data: { users: [], menuItems: [], orders: [], transactions: [] },
@@ -47,6 +198,43 @@ test("authentication rejects invalid credentials", async () => {
   try {
     const response = await fetch(`${base}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "none@test.com", password: "wrong" }) });
     assert.equal(response.status, 401);
+  } finally {
+    server.close();
+  }
+});
+
+test("item reviews include item and restaurant averages", async () => {
+  const customer = { id: "customer-1", name: "Customer", email: "customer@test.com", role: "customer", status: "active" };
+  const vendor = { id: "vendor-1", name: "Oven", email: "vendor@test.com", role: "vendor", status: "active" };
+  const store = {
+    data: {
+      users: [customer, vendor],
+      menuItems: [
+        { id: "pizza-a", name: "Pizza A", category: "Classic", description: "Fresh", price: 12, location: "Downtown", vendor: "Oven", vendorId: "vendor-1", status: "approved", availability: "available" },
+        { id: "pizza-b", name: "Pizza B", category: "Classic", description: "Fresh", price: 14, location: "Downtown", vendor: "Oven", vendorId: "vendor-1", status: "approved", availability: "available" }
+      ],
+      orders: [
+        { id: "order-a", customerId: "customer-1", vendorId: "vendor-1", itemId: "pizza-a", status: "accepted" },
+        { id: "order-b", customerId: "customer-1", vendorId: "vendor-1", itemId: "pizza-b", status: "delivered" }
+      ],
+      transactions: [],
+      reviews: [
+        { id: "review-a", itemId: "pizza-a", vendorId: "vendor-1", customerId: "customer-1", customerName: "Customer", rating: 5, comment: "Excellent", createdAt: "2025-11-20T12:00:00.000Z" },
+        { id: "review-b", itemId: "pizza-b", vendorId: "vendor-1", customerId: "customer-1", customerName: "Customer", rating: 3, comment: "Good", createdAt: "2025-11-21T12:00:00.000Z" }
+      ]
+    },
+    async persist() {},
+    nextId(prefix) { return `${prefix}-1`; }
+  };
+  const app = await createApp({ store, tokenSecret: "test-secret" });
+  const { server, base } = await listen(app);
+  try {
+    const response = await fetch(`${base}/api/reviews/pizza-a`);
+    assert.equal(response.status, 200);
+    const result = await response.json();
+    assert.equal(result.average, 5);
+    assert.equal(result.restaurantAverage, 4);
+    assert.equal(result.restaurantReviewCount, 2);
   } finally {
     server.close();
   }
@@ -125,6 +313,65 @@ test("customer orders require an available item, valid future delivery, and addr
     const delivered = await updateOrder("delivered");
     assert.equal(delivered.status, 200);
     assert.deepEqual(store.data.orders[0].timeline.map((entry) => entry.status), ["pending", "accepted", "delivered"]);
+  } finally {
+    server.close();
+  }
+});
+
+test("cart checkout validates every line before saving quantity-aware orders", async () => {
+  const customer = { id: "customer-1", name: "Customer", email: "customer@test.com", role: "customer", status: "active" };
+  const vendor = { id: "vendor-1", name: "Oven", email: "vendor@test.com", role: "vendor", status: "active" };
+  let orderId = 0;
+  const store = {
+    data: {
+      users: [customer, vendor],
+      menuItems: [
+        { id: "pizza-a", name: "Pizza A", price: 12, vendor: "Oven", vendorId: vendor.id, status: "approved", availability: "available" },
+        { id: "pizza-b", name: "Pizza B", price: 8, vendor: "Oven", vendorId: vendor.id, status: "approved", availability: "available" },
+        { id: "pizza-off", name: "Unavailable Pizza", price: 10, vendor: "Oven", vendorId: vendor.id, status: "approved", availability: "unavailable" }
+      ],
+      orders: [],
+      transactions: []
+    },
+    persistCount: 0,
+    async persist() { this.persistCount += 1; },
+    nextId(prefix) { orderId += 1; return `${prefix}-${orderId}`; }
+  };
+  const app = await createApp({ store, tokenSecret: "test-secret" });
+  const { server, base } = await listen(app);
+  const token = createToken(customer, "test-secret");
+  const checkout = (items) => fetch(`${base}/api/orders/checkout`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+    body: JSON.stringify({
+      items,
+      deliveryDate: new Date(Date.now() + 60 * 60_000).toISOString(),
+      address: "1 Main Street"
+    })
+  });
+  try {
+    const unavailable = await checkout([
+      { itemId: "pizza-a", quantity: 2 },
+      { itemId: "pizza-off", quantity: 1 }
+    ]);
+    assert.equal(unavailable.status, 404);
+    assert.equal(store.data.orders.length, 0);
+    assert.equal(store.persistCount, 0);
+
+    const response = await checkout([
+      { itemId: "pizza-a", quantity: 2 },
+      { itemId: "pizza-b", quantity: 3 }
+    ]);
+    assert.equal(response.status, 201);
+    const { orders } = await response.json();
+    assert.deepEqual(orders.map((order) => [order.itemId, order.quantity, order.totalAmount]), [
+      ["pizza-a", 2, 24],
+      ["pizza-b", 3, 24]
+    ]);
+    assert.equal(orders[0].address, "1 Main Street");
+    assert.equal(orders[0].status, "pending");
+    assert.equal(store.data.orders.length, 2);
+    assert.equal(store.persistCount, 1);
   } finally {
     server.close();
   }
